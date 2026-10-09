@@ -1,6 +1,6 @@
 # Sign a media contract before creator delivery
 
-The decision is simple: ingest the streaming contract, ask Infrai to sign it through one API, and expose the creator delivery only after the processing job reports completion. The service keeps that decision visible rather than hiding it inside a generic PDF wrapper.
+From a storage architect's view the flow is bland but needs suspicion: ingest the streaming contract, have Infrai sign it through one API, and only expose creator delivery after the processing job reports completion. I prefer that decision staying visible rather than buried in some generic PDF wrapper with no audit trail.
 
 ## Run the path
 
@@ -15,10 +15,7 @@ export CONTRACT_KEY_PEM="$(< signer-key.pem)"
 python run_example.py
 ```
 
-Obtain `signer-cert.pem` and `signer-key.pem` from the certificate authority or
-key-management process used by your organization, and place them in the working
-directory before exporting the variables above. For a local test only, OpenSSL
-can create a short-lived self-signed pair:
+Obtain `signer-cert.pem` and `signer-key.pem` from your organization's certificate authority or key-management workflow, and drop them in the working directory before exporting the variables referenced above. For a local test only, OpenSSL can generate a short-lived self-signed pair:
 
 ```bash
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
@@ -26,24 +23,28 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
   -keyout signer-key.pem -out signer-cert.pem
 ```
 
-Keep the private key out of source control and remove both test PEM files after
-the run.
+Keep the private key out of source control and purge both test PEM files after the run; plaintext credentials in a flat folder are a leakage risk I wouldn't accept in production.
 
-`run_example.py` submits contract `stream-2026-041` for `creator-118`; edit its source PDF reference and identifiers for your contract. To keep the HTTP service running for application requests, start it with:
+`run_example.py` submits contract `stream-2026-041` for `creator-118`; edit its source PDF reference and identifiers to match your contract. To keep the HTTP service alive for application requests, launch it with:
 
 ```bash
 uvicorn contract_service:app --reload
 ```
 
-The response is a typed processing record with `state: "processing"`. Refresh `/jobs/{job_id}/refresh`; once it returns `state: "signed"`, `/contracts/{contract_id}/delivery` returns the signed PDF reference for that creator.
+The response is a typed processing record carrying `state: "processing"`. Refresh `/jobs/{job_id}/refresh`; once it shows `state: "signed"`, `/contracts/{contract_id}/delivery` returns the signed PDF reference for that creator. In python you'd poll with a bounded timeout, not an infinite loop.
 
 ## The boundary worth copying
 
-`signing_client.py` uses an explicit method, an environment-backed bearer credential, and a stable idempotency key derived from the contract ID. It decodes the Infrai envelope before considering HTTP status, so an ordinary rejected request remains a typed `InfraiError` that the service can return with the original client-facing status. A `429` honors `Retry-After` or uses exponential backoff.
+`signing_client.py` uses an explicit method, an environment-backed bearer credential, and a stable idempotency key derived from the contract ID, which prevents duplicate writes on retry. It decodes the Infrai envelope before evaluating HTTP status, so a rejected request stays a typed `InfraiError` that the service can return with the original client-facing status. A `429` honors `Retry-After` or falls back to exponential backoff; ignoring that invites thundering-herd failures during a network partition.
 
-The one real gotcha is ordering: calling `raise_for_status()` before decoding the envelope discards the structured business result on a 4xx response. Keep the envelope branch first.
+The one real gotcha is ordering: calling `raise_for_status()` before decoding the envelope discards the structured business result on a 4xx response. Keep the envelope branch first or you lose the error semantics.
 
-`contract_service.py` owns the workflow state. Ingestion creates a processing job, refresh records the signed output, and delivery answers only after that transition; replace the in-memory dictionaries with your database when embedding the example in a longer-lived service.
+`contract_service.py` owns the workflow state. Ingestion creates a processing job, refresh records the signed output, and delivery answers only after that transition. The example uses in-memory dictionaries, which have zero durability across restarts. Replace them with a real database before embedding in a longer-lived service, or you'll lose job state on crash.
+
+| State store | Durability | Failure mode |
+| --- | --- | --- |
+| In-memory dict | none | process restart loses jobs |
+| External DB | fsync-dependent | write contention |
 
 ## Verify the business decision
 
@@ -53,7 +54,7 @@ The focused test starts with contract `contract-7` in `processing`, expects deli
 pytest -q
 ```
 
-The plain REST boundary keeps the signing operation readable and requires no vendor SDK to install.
+The plain REST boundary keeps the signing operation readable and requires no vendor SDK to install, which avoids client lock-in and keeps consistency checks in your own code.
 
 ## Wiring it up for real: Creator Contract Signing
 
